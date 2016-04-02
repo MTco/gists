@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# This script is a part of the android app Raspicast.
+# --------------------------------------------------------------------
+# To install: 
+# "sudo apt-get install fbi" (Debian)
+# "chmod +x fbishow" - making it executable
+# "sudo chown root fbishow" - making sure that only root can edit it
+# "sudo mv fbishow /usr/bin/fbishow"
+# "sudo nano /etc/sudoers" and add this as the last line:
+# "your_user All=(root) NOPASSWD: /usr/bin/fbishow"
+# ---------------------------------------------------------------------
+
+sudo killall fbi >/dev/null 2>&1 && sudo sh -c "TERM=linux setterm -reset> /dev/tty2"
+if [ "$1" != "kill" ]
+then
+	sudo fbi -T 2 -d /dev/fb0 -a -noverbose "$@" >/dev/null 2>&1 </dev/null
+fi
