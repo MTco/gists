@@ -1,0 +1,214 @@
+#!/opt/local/bin/perl -w
+# Copyright © 2004-2016 Jamie Zawinski <jwz@jwz.org>
+#
+# Permission to use, copy, modify, distribute, and sell this software and its
+# documentation for any purpose is hereby granted without fee, provided that
+# the above copyright notice appear in all copies and that both that
+# copyright notice and this permission notice appear in supporting
+# documentation.  No representations are made about the suitability of this
+# software for any purpose.  It is provided "as is" without express or 
+# implied warranty.
+#
+# Resizes the given image files to fit the specified size.
+# Default: not wider than 900, not taller than 750.
+# If the image has EXIF rotation, it is rotated to be upright.
+# Any other existing EXIF data is preserved.
+#
+# Created: 13-Jun-2004.
+# Rewritten to use Image::Magick instead of pnmscale, 22-Apr-2005.
+
+require 5;
+use diagnostics;
+use strict;
+use bytes;
+
+use Image::Magick;
+
+my $progname = $0; $progname =~ s@.*/@@g;
+my ($version) = ('$Revision: 1.17 $' =~ m/\s(\d[.\d]+)\s/s);
+
+my $verbose = 0;
+my $default_width  = 1920;
+my $default_height = 1920;
+my $default_quality = 90;
+
+my $tmpfile = undef;  # we unlink this on abnormal exit
+END { unlink $tmpfile if defined($tmpfile); }
+
+sub signal_cleanup() { exit (1); }  # This causes END{} to run.
+$SIG{HUP}  = \&signal_cleanup;
+$SIG{INT}  = \&signal_cleanup;
+$SIG{QUIT} = \&signal_cleanup;
+$SIG{ABRT} = \&signal_cleanup;
+$SIG{KILL} = \&signal_cleanup;
+$SIG{TERM} = \&signal_cleanup;
+
+
+
+# Check and print error status from various Image::Magick commands,
+# and die if it's not just a warning.
+#
+sub imagemagick_check_error {
+  my ($err) = @_;
+  return unless $err;
+  my ($n) = ($err =~ m/(\d+)/);
+
+  if ($n && $n == 395 && $err =~ m/unable to open module file/) {
+    #
+    # This error is bullshit: ignore it:
+    #
+    #    Exception 395: unable to open module file
+    #      `/opt/local/lib/ImageMagick-6.3.0/modules-Q16/coders/008d1bed.la':
+    #      No such file or directory
+    #
+    return;
+  }
+
+  print STDERR "$progname: $err\n";
+  print STDERR "$progname: maybe \$TMPDIR (".
+               ($ENV{TMPDIR} || "/tmp") . ") filled up?\n"
+    if ($err =~ m/pixel cache/i);
+
+  exit (1) if ($n >= 400);
+}
+
+
+sub resize_img {
+  my ($w, $h, $q, $strip_p, $file) = @_;
+
+  my @st = stat ($file);
+  error ("$file does not exist") unless ($#st > 0);
+  my $size = $st[7];
+
+  my $img = Image::Magick->new;
+  my $status = $img->Read ($file);
+  imagemagick_check_error ($status);
+
+  my ($fw, $fh) = $img->Get ('width', 'height');
+  error ("$file: unparsable") unless ($fw && $fw > 0 && $fh > 0);
+
+
+  my $ss = "$fw x $fh,";
+  print STDERR "$progname: " if ($verbose);
+  print STDERR sprintf("%s\t%12s %4d KB ", $file, $ss, $size/1024);
+  print STDERR "\n" if ($verbose);
+
+  my ($orient) = $img->Get('exif:orientation');
+  $orient = 1 unless defined($orient); # Top-Left
+
+  if ($fw > $w || $fh > $h || $orient != 1) {
+
+    if ($orient != 1) {
+      print STDERR "$progname: $file: auto-rotating\n" if ($verbose);
+      $status = $img->AutoOrient();
+      imagemagick_check_error ($status);
+      ($fw, $fh) = $img->Get ('width', 'height');   # might have transposed.
+    }
+
+    my $wscale = $w / $fw;
+    my $hscale = $h / $fh;
+    my $scale = ($wscale < $hscale ? $wscale : $hscale);
+
+    print STDERR "$progname: $file: scaling by $scale\n" if ($verbose);
+
+    $status = $img->Scale (width  => int ($fw * $scale),
+                           height => int ($fh * $scale));
+    imagemagick_check_error ($status);
+
+    $status = $img->Set (quality => $q);
+    imagemagick_check_error ($status);
+
+    if ($strip_p) {
+      print STDERR "$progname: $file: stripping\n" if ($verbose);
+      $status = $img->Strip();
+      imagemagick_check_error ($status);
+    }
+
+    $tmpfile = sprintf ("%s.%08X", $file, int (rand(0xFFFFFF)));
+
+    print STDERR "$progname: $tmpfile: writing with quality $q\n"
+      if ($verbose);
+
+    $status = $img->Write (filename => $tmpfile);
+    imagemagick_check_error ($status);
+    undef $img;
+
+    if (!rename ($tmpfile, $file)) {
+      unlink ($tmpfile);
+      error ("mv $tmpfile $file: $!");
+    }
+
+    # Now check (and print) the size of the file we just wrote.
+    #
+    my $fmt;
+    $img = Image::Magick->new;
+    ($fw, $fh, $size, $fmt) = $img->Ping ($file);
+    error ("$file vanished!") unless ($size > 0);
+
+    print STDERR "$progname: $file " if ($verbose);
+    print STDERR sprintf("\t--> %d x %d, %d%%, %4d KB\n",
+                         $fw, $fh, $q, $size/1024);
+  } else {
+    if ($verbose) {
+      print STDERR "$progname: $file: unchanged\n";
+    } else {
+      print STDERR "\t--> unchanged\n";
+    }
+  }
+
+  undef $img;
+}
+
+sub error {
+  my ($err) = @_;
+  print STDERR "$progname: $err\n";
+  exit 1;
+}
+
+sub usage {
+  print STDERR "usage: $progname [--verbose] [ --quality NN ] [ --strip ]" .
+    "[ max-w max-h ] image-files ...\n";
+  exit 1;
+}
+
+sub main {
+  my ($w, $h);
+  my $q = $default_quality;
+  my $strip_p = 0;
+
+  my @files = ();
+  while ($#ARGV >= 0) {
+    $_ = shift @ARGV;
+    if ($_ eq "--verbose") { $verbose++; }
+    elsif (m/^-v+$/) { $verbose += length($_)-1; }
+    elsif (m/^\d+$/) {
+      if    (!defined ($w)) { $w = $_; }
+      elsif (!defined ($h)) { $h = $_; }
+      else { usage(); }
+    }
+    elsif (m/^(-q|--qual(ity)?)$/) { $q = shift @ARGV; }
+    elsif (m/^--?strip$/) { $strip_p++; }
+    elsif (m/^--?no-?strip$/) { $strip_p = 0; }
+    elsif (m/^\d+$/) { $h = $_; }
+    elsif (m/^-./) { usage; }
+    else { push @files, $_; }
+  }
+
+  if ((defined($w) && !defined($h)) ||
+      (defined($h) && !defined($w))) {
+    usage();
+  }
+
+  $w = $default_width  unless defined ($w);
+  $h = $default_height unless defined ($h);
+
+  usage() if ($#files < 0);
+  usage() if ($w < 10 || $h < 10 || $q < 5 || $q > 100);
+
+  foreach (@files) {
+    resize_img ($w, $h, $q, $strip_p, $_);
+  }
+}
+
+main;
+exit 0;

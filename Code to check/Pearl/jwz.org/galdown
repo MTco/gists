@@ -1,0 +1,1376 @@
+#!/usr/bin/perl -w
+# Copyright © 2006-2016 Jamie Zawinski <jwz@jwz.org>
+#
+# Permission to use, copy, modify, distribute, and sell this software and its
+# documentation for any purpose is hereby granted without fee, provided that
+# the above copyright notice appear in all copies and that both that
+# copyright notice and this permission notice appear in supporting
+# documentation.  No representations are made about the suitability of this
+# software for any purpose.  It is provided "as is" without express or
+# implied warranty.
+#
+# Bulk-downloads images from a variety of web photo galleries.  Works on:
+#
+#   - Flickr
+#   - Facebook
+#   - Picasa
+#   - OvaHere
+#   - SmugMug, SF Station
+#   - SF Weekly, LA Weekly, Village Voice
+#   - Zen Folio
+#   - Google Drive
+#   - SkyDrive
+#   - Instagram (by hashtag)
+#
+# To customize: add entries to the @handlers list.
+#
+# Install "exiftool" to make downloaded file names to be properly sorted
+# by the date the photo was taken.
+#
+# When downloading from Facebook, it uses your Safari cookies to log in.
+# If you want to use a browser other than Safari, code needs to be written.
+#
+# Created: 29-Dec-2006.
+
+require 5;
+use diagnostics;
+use strict;
+use POSIX;
+use LWP::UserAgent;
+use LWP::Simple;
+use HTTP::Cookies;
+use Date::Parse;
+use JSON::Any;
+
+my $progname = $0; $progname =~ s@.*/@@g;
+my ($version) = ('$Revision: 1.59 $' =~ m/\s(\d[.\d]+)\s/s);
+
+my $verbose = 1;
+my $debug_p = 0;
+
+
+my @handlers =
+  ( { url   => '^https?://[a-z.]*flickr\.com/',
+      list  => \&flickr_list },
+
+    { url   => '^https?://[a-z.]*facebook\.com/',
+      list  => \&facebook_list,
+      down  => \&facebook_down },
+
+    { url   => '^https?://picasaweb\.google\.com/',
+      list  => \&picasa_list },
+
+    { url   => '^https?://[a-z.]*ovahere\.com/',
+      list  => \&ovahere_list },
+
+    { body  => 'class="[^\"]*\b(smugmug|sm-nui)',  # Any site running Smugmug
+      list  => \&smug_list },
+
+    { body  => "class='vvmlb'",		# sfweekly.com, villagevoice.com, etc.
+      list  => \&weekly_list },
+
+    { body  => 'cdn\.zenfolio\.net/',	# Any site running Zen Folio
+      list  => \&zenfolio_list },
+
+    { url   => '^https?://drive\.google\.com/',
+      list  => \&googledrive_list },
+
+    { url   => '^https?://skydrive\.live\.com/',
+      list  => \&skydrive_list },
+
+    { url   => '^https?://(instagr\.am|instagram\.com|statigr\.am)/',
+      list  => \&instagram_list },
+  );
+
+
+sub url_unquote($) {
+  my ($u) = @_;
+  $u =~ s/[+]/ /g;
+  $u =~ s/%([a-z0-9]{2})/chr(hex($1))/ige;
+  return $u;
+}
+
+
+# Default image downloader. Overridable in the @handlers table.
+#
+sub download_image($$;$) {
+  my ($img, $file, $override_date) = @_;
+
+  # LWP::Simple::getstore doesn't set the file date to the Last-Modified time!
+  # So we have to do it the hard way.
+  # LWP::Simple::getstore ($img, $file);
+
+  my $ua   = $LWP::Simple::ua;
+  my $res  = $ua->get ($img);
+  my $ret  = ($res && $res->code) || '';
+  my $body = ($res && $res->content) || '';
+  my $date = $res->header ('Last-Modified');
+
+  $date = str2time($date) if $date;
+  $date = $override_date if $override_date;
+
+  error ("status $ret: $img") unless ($res->is_success);
+  error ("null body: $img") unless (length($body) > 255);
+  open (my $out, '>:raw', $file) || error ("$file: $!");
+  print $out $body;
+  close $out;
+
+  if ($date) {
+    print STDERR "$progname: updating time: $file\n" if ($verbose > 2);
+    utime ($date, $date, $file);
+  }
+}
+
+
+# Find a handler for the URL and run it.
+#
+sub download_gallery($) {
+  my ($url) = @_;
+
+  $LWP::Simple::ua->agent ("$progname/$version");
+
+  my $body = undef;
+
+  foreach my $h (@handlers) {
+    my $m1 = $h->{url};
+    my $m2 = $h->{body};
+    error ("must specify either 'url' or 'body' pattern")
+      unless ($m1 || $m2);
+
+    my $matchedp = 0;
+
+    if ($m1 && $url =~ m/$m1/six) {
+      print STDERR "$progname: matched URL: $m1\n" if ($verbose > 2);
+      $matchedp = 1;
+    }
+
+    if (!$matchedp && $m2) {
+      $body = LWP::Simple::get($url) unless $body;
+      if ($body =~ m/$m2/six) {
+        print STDERR "$progname: matched body: $m2\n" if ($verbose > 2);
+        $matchedp = 1;
+      }
+    }
+
+    if ($matchedp) {
+      my ($title, $imgs) = $h->{list} ($url, $body);
+      my $i = 0;
+      my $dir = pick_directory ($url, $title);
+      $dir =~ s@/+$@@s;
+      if (! -d $dir) {
+        print STDERR "$progname: mkdir $dir/\n" if ($verbose);
+        mkdir ($dir) unless ($debug_p);
+      }
+
+      # Elements of the @img list returned by handlers may be URLs,
+      # or pairs of [ "URL", "image title" ].
+
+
+      # If every image has the same title, ignore them entirely.
+      {
+        my $same_p = 1;
+        my $last = "";
+        foreach my $img (@$imgs) {
+          if (ref($img) eq 'ARRAY') {
+            my $n = lc($img->[1] || '');
+            $n =~ s/\d+$//s;
+            if ($last && $n && $n ne $last) {
+              $same_p = 0;
+            }
+            $last = $n;
+          }
+        }
+        if ($same_p) {
+          foreach my $img (@$imgs) {
+            $img->[1] = '' if (ref($img) eq 'ARRAY');
+          }
+        }
+      }
+
+      my @ofiles = ();
+      foreach my $img (@$imgs) {
+        next unless $img;
+        my $name = '';
+
+        if (ref($img) eq 'ARRAY') {
+          $name = $img->[1] || '';
+          $img = $img->[0];
+        }
+
+        # Sanitize the name, and use it as a suffix, after the number.
+        $name =~ s/[^-_.a-z\d]/_/gsi;
+        $name = "-$name" if $name;
+
+        $i++;
+        my ($suf) = ($img =~ m@\.([^/.]+)$@si);
+        $suf =~ s@\?.*@@gs if $suf;
+        error ("no suffix: $img") unless $suf;
+
+        $img =~ s@\#.*$@@s;  # lose anchor
+
+        my $file = sprintf("%s/%03d%s.%s", $dir, $i, $name, $suf);
+        if ($debug_p) {
+          print STDERR "$progname: not downloading: $img\n";
+        } else {
+          unlink $file;
+          my $down = $h->{down} || \&download_image;
+          print STDERR "$progname: downloading: $img\n" if ($verbose > 1);
+          $down->($img, $file);
+
+          if (! -f $file) {
+            print STDERR "$progname: ERROR: $img: unsaved!\n";
+          } else {
+            print STDERR "$progname: wrote $file\n" if ($verbose);
+            parse_exif ($file);
+          }
+        }
+        push @ofiles, $file;
+      }
+      rename_by_date (@ofiles);
+      return;
+    }
+  }
+  error ("unrecognized URL: $url");
+}
+
+
+# Convert a gallery's title to a sensible directory name.
+#
+sub pick_directory($$) {
+  my ($url, $title) = @_;
+
+  ($title) = ($url =~ m@([^/]+)/*$@si) unless $title;
+  $title =~ s@ - .+?$@@si;
+  $title = lc($title);
+  $title =~ s/[^a-z\d]+/_/gsi;
+  $title =~ s/_+/_/gsi;
+  $title =~ s/^_+|_+$//gsi;
+  return $title;
+}
+
+
+# Set file mtime to EXIF's time.
+#
+sub parse_exif($) {
+  my ($file) = @_;
+  my $cmd = "exiftool -q -'DateTimeOriginal>FileModifyDate' '$file'";
+  print STDERR "$progname: exec: $cmd\n" if ($verbose > 2);
+  $cmd .= ' 2>&-' unless ($verbose > 2);   # exiftool won't shut up
+  safe_system ($cmd);
+}
+
+# Rename all of the files to be sequential by creation date.
+#
+sub rename_by_date(@) {
+  my (@files) = @_;
+
+  print STDERR "$progname: renaming by date...\n" if ($verbose);
+  print STDERR "\n" if ($debug_p || $verbose > 1);
+
+  my %dates;
+  foreach my $f (@files) {
+    my $date = (stat($f))[9];
+    $dates{$f} = ($date || -1);
+    # error ("$f does not exist") unless ($date || $debug_p);
+    if (! $date) {
+      print STDERR "$f does not exist\n" unless ($debug_p);
+      next;
+    }
+  }
+
+  # Find the target file names in the new order
+  #
+  @files = sort { $dates{$a} <=> $dates{$b} } @files;
+  my $i = 1;
+  my %rename;
+  my %swap;
+  foreach my $f (@files) {
+    my ($dir, $oname, $suf) = ($f =~ m@^(.*?)([^/]+)\.([^/.]+)$@s);
+    if ($oname =~ m/^\d+-(.+)$/s) {
+      $oname = "-$1";
+    } else {
+      $oname = "";
+    }
+    $rename{$f} = sprintf("%s%03d%s.%s", $dir, $i, $oname, $suf);
+    $swap{$f}  = sprintf("%s.%03d%s.%s", $dir, $i, $oname, $suf);
+    $i++;
+  }
+
+  # Rename to dot files
+  #
+  foreach my $f1 (@files) {
+    next unless ($debug_p || $dates{$f1} > 0);
+    my $f2 = $swap{$f1};
+    rename ($f1, $f2) || error ("mv $f1 $f2: $!")
+      unless $debug_p;
+    print STDERR "$progname: mv $f1 $f2\n" if ($debug_p || $verbose > 1);
+  }
+
+  # Rename them back
+  #
+  print STDERR "\n" if ($debug_p || $verbose > 1);
+  foreach my $f0 (@files) {
+    next unless ($debug_p || $dates{$f0} > 0);
+    my $f1 = $swap{$f0};
+    my $f2 = $rename{$f0};
+    rename ($f1, $f2) || error ("mv $f1 $f2: $!")
+      unless $debug_p;
+    print STDERR "$progname: mv $f1 $f2\n" if ($debug_p || $verbose > 1);
+  }
+}
+
+
+# Like system() but respects error codes.
+#
+sub safe_system(@) {
+  my @cmd = @_;
+  system (@cmd);
+  my $exit_value  = $? >> 8;
+  my $signal_num  = $? & 127;
+  my $dumped_core = $? & 128;
+  error ("$cmd[0]: core dumped!") if ($dumped_core);
+  error ("$cmd[0]: signal $signal_num!") if ($signal_num);
+# error ("$cmd[0]: exited with $exit_value!") if ($exit_value);
+  return $exit_value;
+}
+
+
+# expands the first URL relative to the second.
+#
+sub expand_url($$) {
+  my ($url, $base) = @_;
+
+  $url =~ s/^\s+//gs;  # lose whitespace at front and back
+  $url =~ s/\s+$//gs;
+
+  $url =~ s@^//@http://@;  # amazingly, this is legal
+
+  if (! ($url =~ m/^[a-z]+:/)) {
+
+    $base =~ s@(\#.*)$@@;       # strip anchors
+    $base =~ s@(\?.*)$@@;       # strip arguments
+    $base =~ s@/[^/]*$@/@;      # take off trailing file component
+
+    my $tail = '';
+    if ($url =~ s@(\#.*)$@@) { $tail = $1; }         # save anchors
+    if ($url =~ s@(\?.*)$@@) { $tail = "$1$tail"; }  # save arguments
+
+    my $base2 = $base;
+
+    $base2 =~ s@^([a-z]+:/+[^/]+)/.*@$1@        # if url is an absolute path
+      if ($url =~ m@^/@);
+
+    my $ourl = $url;
+
+    $url = $base2 . $url;
+    $url =~ s@/\./@/@g;                         # expand "."
+    1 while ($url =~ s@/[^/]+/\.\./@/@g);       # expand ".."
+
+    $url .= $tail;                              # put anchors/args back
+
+    print STDERR "$progname: relative URL: $ourl --> $url\n"
+      if ($verbose > 6);
+
+  } else {
+    print STDERR "$progname: absolute URL: $url\n"
+      if ($verbose > 7);
+  }
+
+  return $url;
+}
+
+
+# Given a Flickr image URL, upgrade to the URL of the original-sized image.
+#
+sub flickr_crack_secret($) {
+  my ($img) = @_;
+
+  # Go Fuckr yourselves. Nice DRM you have there, shame if it got broken.
+  # Here's a clue, you shitheels: if you embed your secret API key in
+  # code that is run inside a web browser, it's not actually a secret.
+  #
+  my $url = 'https://www.flickr.com//hermes_error_beacon.gne';
+  my $json = LWP::Simple::get($url);
+  ($json =~ m/"site_key":"(.*?)"/s) || error ("unable to load Flickr api key");
+  my $api_key = $1;
+
+  my ($id) = ($img =~ m@/\d+/(\d+)_[a-f\d]+_@si);
+  error ("no ID in $img") unless $id;
+
+  $url = ('https://api.flickr.com/services/rest' .
+          '?method=flickr.photos.getInfo' .
+          '&photo_id=' . $id .
+          '&api_key=' . $api_key);
+
+  print STDERR "$progname: parsing $url\n" if ($verbose > 1);
+  my $xml = LWP::Simple::get($url);
+  error ("no XML for $img") unless $xml;
+  error ("bad XML for $img: $xml") if ($xml =~ m@<err\b@s);
+  ($xml) = ($xml =~ m@<photo([^<>]*)>@si);
+  error ("no <photo> in XML for $img") unless $xml;
+     ($id)     = ($xml =~ m@\b id="(.*?)"@sx);
+  my ($farm)   = ($xml =~ m@\b farm="(.*?)"@sx);
+  my ($serv)   = ($xml =~ m@\b server="(.*?)"@sx);
+  my ($fmt)    = ($xml =~ m@\b originalformat="(.*?)"@sx);
+  my ($secret) = ($xml =~ m@\b originalsecret="(.*?)"@sx);
+  error ("unparsable XML for $img in $url")
+    unless ($id && $farm && $serv && $fmt && $secret);
+
+  $url = "https://farm$farm.staticflickr.com/$serv/${id}_${secret}_o.$fmt";
+  return $url;
+}
+
+
+# Use Safari cookies when accessing Facebook.  Fucking Facebook.
+# (If you use Firefox, this code will need to be different.)
+#
+my $cookies_loaded_p;
+#my $foundation_loaded_p;
+#my $safari_loaded_p;
+#BEGIN {
+#  eval 'use Foundation; $foundation_loaded_p = 1;';
+#  eval 'use HTTP::Cookies::Safari; $safari_loaded_p = 1;'
+#    unless $foundation_loaded_p;
+# }
+#
+#
+#sub OLD_load_safari_cookies($$) {
+#  my ($ua, $match) = @_;
+#
+#  my $count = 0;
+#
+#  if ($foundation_loaded_p) {
+#
+#    my $jar = HTTP::Cookies->new();
+#    my $storage = eval 'NSHTTPCookieStorage->sharedHTTPCookieStorage';
+#
+#    # Hooray, this stopped working on MacOS 10.11.
+#    # But it still sees the NSString class, so why????
+#    #
+#    # my $s1 = NSString->stringWithCString_("Hello ");
+#    # my $s2 = NSString->alloc()->initWithCString_("World");
+#    # my $s3 = $s1->stringByAppendingString_($s2);
+#    # printf "%s\n", $s3->cString();
+#
+#
+#    # Oh, this works, but I already wrote a parser for Cookies.binarycookies.
+#    #
+#    use Foundation;
+#    package NSHTTPCookieStorage;
+#    @ISA = qw(PerlObjCBridge);
+#    @EXPORT = qw( );
+#    my $storage = NSHTTPCookieStorage->sharedCookieStorageForGroupContainerIdentifier_("Cookies");
+#
+#
+#    if (!$storage) {
+#      print STDERR "$progname: unable to load Safari cookies.\n";
+#      print STDERR "$progname: " .
+#        ($foundation_loaded_p ? "unknown error" :
+#         "unable to load Foundation module") . ".\n";
+#      return;
+#    }
+#
+#    my $enum = $storage->cookies->objectEnumerator;
+#    while (my $cookie = $enum->nextObject) {
+#      last unless $$cookie;
+#
+#      my $domain  = $cookie->domain->cString;
+#      my $name    = $cookie->name->cString;
+#      my $path    = $cookie->path->cString;
+#      my $value   = $cookie->value->cString;
+#      my $secure  = 0;
+#      my $version = 0;
+#      my $port    = undef;
+#      my $maxage  = 100000;
+#
+#      next unless ($domain =~ m/$match/si);
+#
+#      print STDERR ("$progname: cookie:" .
+#                    " domain=$domain" .
+#                    " name=$name" .
+#                    " path=$path" .
+#                    " value=$value" .
+#                    "\n")
+#        if ($verbose > 2);
+#      $jar->set_cookie ($version, $name, $value, $path,
+#                        $domain, $port, $path, $secure, $maxage);
+#      $count++;
+#    }
+#    $ua->cookie_jar ($jar);
+#
+#  } elsif ($safari_loaded_p) {
+#    my $jar = HTTP::Cookies::Safari->new;
+#    $jar->load($ENV{HOME} . 'Library/Cookies/Cookies.binarycookies');
+#    $jar->scan( sub() { $count++; } );
+#  }
+#
+#  $cookies_loaded_p = ($count > 0);
+#  print STDERR "$progname: loaded $count Safari cookies\n"
+#    if ($verbose > 1 ||
+#        (!$cookies_loaded_p && ($safari_loaded_p || $foundation_loaded_p)));
+#}
+
+
+sub load_safari_cookies($$) {
+  my ($ua, $match) = @_;
+
+  my $count = 0;
+  my $jar = HTTP::Cookies->new();
+
+  # You gotta be fucking kidding me.
+  # http://www.securitylearn.net/2012/10/27/cookies-binarycookies-reader/
+
+  my $file = $ENV{HOME} . "/Library/Cookies/Cookies.binarycookies";
+  open (my $in, '<:raw', $file) || return;
+
+  my $buf = '';
+  my $out;
+  read ($in, $buf, 4);
+  $out = unpack ("A*", $buf);	# big-endian
+  $out =~ m/^cook$/s || error ("$file: give me a cookie");
+
+  read ($in, $buf, 4);
+  my $npages = unpack ("N*", $buf);		# big-endian
+
+  # Read page sizes
+  my @page_sizes = ();
+  for (my $i = 0; $i < $npages; $i++) {
+    read ($in, $buf, 4);
+    my $size = unpack ("N*", $buf);		# big-endian
+    $page_sizes[$i] = $size;
+  }
+
+  # Read pages
+  my @pages = ();
+  for (my $i = 0; $i < $npages; $i++) {
+    read ($in, $buf, $page_sizes[$i]);
+    $pages[$i] = $buf;
+  }
+  close ($in);
+
+  # Parse pages
+  for (my $i = 0; $i < $npages; $i++) {
+    my $page = $pages[$i];
+    my $ptr = 0;
+    $buf = substr ($page, $ptr, 4); $ptr += 4;
+    my $tag = unpack ("N*", $buf);		# big-endian
+
+    error ("unparsable page $i: tag $tag") unless ($tag == 256);
+
+    $buf = substr ($page, $ptr, 4); $ptr += 4;
+    my $ncookies = unpack ("L*", $buf); 	# little-endian
+
+    for (my $j = 0; $j < $ncookies; $j++) {
+      $buf = substr ($page, $ptr, 4); $ptr += 4;
+      my $ptr2 = unpack ("L*", $buf);   	# little-endian
+      my $start = $ptr2;
+
+      my @fields = ();
+      for (my $k = 0; $k < 8; $k++) {
+        $buf = substr ($page, $ptr2, 4); $ptr2 += 4;
+        $fields[$k] = unpack ("L*", $buf);	# little-endian
+      }
+
+      my ($csize, undef, $flags, undef,
+          $dom_off, $name_off, $path_off, $val_off) = @fields;
+      foreach ($dom_off, $name_off, $path_off, $val_off) {
+        $_ += $start;  # increment each
+      }
+
+      my $dom  = substr ($page, $dom_off,  $name_off   - $dom_off  - 1);
+      my $name = substr ($page, $name_off, $path_off   - $name_off - 1);
+      my $path = substr ($page, $path_off, $val_off    - $path_off - 1);
+      my $val  = substr ($page, $val_off,  $csize + $start - $val_off  - 1);
+
+      foreach ($dom, $name, $path, $val) {
+        $_ =~ s/\000.*$//s;  # null-terminate each
+      }
+
+      if ($dom =~ m/$match/si) {
+
+        print STDERR ("$progname: cookie:" .
+                      " domain=$dom" .
+                      " name=$name" .
+                      " path=$path" .
+                      " value=$val" .
+                      "\n")
+          if ($verbose > 2);
+
+        my $secure  = 0;
+        my $version = 0;
+        my $port    = undef;
+        my $maxage  = 100000;
+
+        $jar->set_cookie ($version, $name, $val, $path,
+                          $dom, $port, $path, $secure, $maxage);
+        $count++;
+      }
+    }
+  }
+
+  $ua->cookie_jar ($jar);
+
+  $cookies_loaded_p = ($count > 0);
+  print STDERR "$progname: loaded $count Safari cookies\n"
+    if ($verbose > 1 || !$cookies_loaded_p);
+}
+
+
+###################################################################### Flickr
+
+sub flickr_list($$);
+sub flickr_list($$) {
+  my ($base_url, $body) = @_;
+
+  my $title = undef;
+  my @imgs = ();
+
+  # Use the mobile site, because it gives us real HTML instead of AJAX fuckery.
+  # Without this, we only get the first 25 photos and no "Next page" link.
+  $base_url =~ s@^(https://)www\.@$1m.@si;
+
+  $base_url =~ s@/with/\d+/?$@/@si;
+
+  my $url = $base_url;
+
+  # /photos/NAME/NNN/in/set-MMM/ -> /photos/NAME/sets/MMM/
+  $url =~ s@^(.*)/\d+/in/set-(\d+)/?$@$1/sets/$2@si;
+
+  $url =~ m@/(sets|date-taken)/@ ||
+    error ("this only works on \"/sets/\" or \"/date-taken/\" URLs: $url");
+
+  my ($dir) = ($url =~ m@/([^/]+/sets/[^/]+)(/page\d+)?/?(\?[^/]+)?$@);
+     ($dir) = ($url =~ m@/([^/]+/archives/date-taken/\d+/\d+)/@) unless $dir;
+  error ("unparsable directory: $url") unless $dir;
+  $dir =~ s@(/sets|/archives/date-taken)/@_@s;
+  $dir =~ s@/@_@gs;
+  $dir =~ s@\?.*$@@s;
+
+  print STDERR "$progname: parsing $url\n" if ($verbose);
+  $body = (LWP::Simple::get($url) || '')
+    unless $body;
+
+  error ("must be signed in for $url")
+    if ($body =~ m/You must be signed in to see this content/i);
+
+  if (! defined($title)) {
+    my ($attr) = ($body =~ m@<li class="attribution">(.*?)</li>@si);
+    my ($desc) = ($body =~ m@<li class="description">(.*?)</li>@si);
+    error ("no attribution in $url") unless $attr;
+    error ("no description in $url") unless $desc;
+    $title = "$attr: $desc";
+    $title =~ s/<[^<>]*>//gs;
+    $title =~ s/\s+/ /gs;
+    $title =~ s/^\s+|\s+$//gs;
+    $title =~ s/^By //gs;
+    $title =~ s/ :/:/gs;
+  }
+
+  $body =~ s/\s+/ /gs;
+
+  error ("private gallery: $url") if ($body =~ m@<title>Sign in to@si);
+
+  my %dups;
+  my $count = 0;
+
+  my $url2 = $url;
+  while ($url2) {
+
+    $body =~ s% ( <A \b .*?> ) .*? ( <IMG .*? > ) %{
+      my ($href, $img) = ($1, $2);
+      ($href) = ($href =~ m/HREF="(.*?)"/si);
+      ($img)  = ($img  =~ m/SRC="(.*?)"/si);
+
+      if ($href =~ m@/in/set-@s &&
+          $img =~ m@/\d+/\d+_[a-f\d]+_@s) {
+        if (! $dups{$img}) {
+          $dups{$img} = 1;
+          $img = flickr_crack_secret($img);
+          print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+          push @imgs, [ $img ];
+          $count++;
+        }
+      }
+      "";
+    }%gsexi;
+
+    ($url2) = ($body =~ m@<A \s+ [^<>]*? pagination-next [^<>]*? \b
+                          HREF = "(.*?)"@six);
+    if ($url2) {
+      $url2 = expand_url($url2, $base_url);
+      print STDERR "$progname: parsing $url2\n" if ($verbose);
+      $body = LWP::Simple::get($url2);
+    }
+  }
+
+  return ($title, \@imgs);
+}
+
+
+###################################################################### Smugmug
+
+sub smug_list($$) {
+  my ($base_url, $body) = @_;
+
+  my $title = undef;
+  my @imgs = ();
+  my $url = $base_url;
+
+  $url =~ s@#.*$@@s;
+  my ($host) = ($url =~ m@^(http://[^/]+)@si);
+  my ($dir) = ($url =~ m@/(\d+_[\dA-Z]+)$@si);
+
+  # If no ID in URL, look for it in LINK tags.
+  ($dir) = ($body =~ m@Type=gallery&Data=(\d+_[\dA-Z]+)@si) unless $dir;
+
+  error ("no id in $url") unless $dir;
+
+  # Smugmug's galleries are a gigantic pain in the ass to parse, so instead
+  # we parse their RSS feed -- however, some Smugmug sites (maybe the "Pro"
+  # ones?) do not give us RSS at all, and in that case, we're just fucked.
+
+  $url = ("$host/hack/feed.mg" .
+          "?Type=gallery" .
+          "&Data=$dir" .
+          "&ImageCount=9999" .
+          "&Paging=0" .
+          "&format=atom10");
+
+  print STDERR "$progname: parsing $url\n" if ($verbose);
+  $body = (LWP::Simple::get($url) || '');
+  error ("RSS feed is disabled: $url") unless $body;
+
+  my @iimgs;
+  $body =~ s!<id>([^<>]+)</id>!{ push @iimgs, $1; }!gsexi;
+
+  ($title) = ($body =~ m@<TITLE[^<>]*>\s*(.*?)\s*</TITLE>@si);
+
+  my ($by) = ($body =~ m@photos? by ([^<>]+)@si);
+  $by =~ s/ See event.*//si if $by;
+  $title = "$by: $title" if $by;
+
+  my %done;
+  foreach my $img (@iimgs) {
+    next unless ($img =~ m/\.jpg$/s);
+    $img =~ s/-\d\.jpg$/.jpg/s;
+    $img =~ s/-Th\.jpg$/-O.jpg/s;
+    $img =~ s@/Th/@/O/@s;
+    next if ($done{$img});
+    $done{$img} = 1;
+    push @imgs, $img;
+    print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+  }
+
+  return ($title, \@imgs);
+}
+
+
+#################################################################### Zen Folio
+
+sub zenfolio_list($$) {
+  my ($base_url, $body) = @_;
+
+  my $title = undef;
+  my @imgs = ();
+  my $url = $base_url;
+
+  $url =~ s@#.*$@@s;
+  my ($host) = ($url =~ m@^(http://[^/]+)@si);
+  my ($dir) = ($url =~ m@/([\dA-Z]+)/?$@si);
+  error ("no id in $url") unless $dir;
+
+  my ($rss) = ($body =~ m@href="([^<>\"]+/recent\.rss)"@si);
+  error ("no RSS in $url") unless $rss;
+
+  print STDERR "$progname: parsing $rss\n" if ($verbose);
+  $body = (LWP::Simple::get($rss) || '');
+
+  my @iimgs;
+  $body =~ s!<media:content[^<>]*? url="([^<>\"]+)"!{ push @iimgs, $1; }!gsexi;
+
+  ($title) = ($body =~ m@<TITLE[^<>]*>\s*(.*?)\s*</TITLE>@si);
+
+  my ($by) = ($body =~ m@photos? by ([^<>]+)@si);
+  $by =~ s/ See event.*//si if $by;
+  $title = "$by: $title" if $by;
+
+  my %done;
+  foreach my $img (@iimgs) {
+    next unless ($img =~ m/\.jpg$/s);
+    next if ($done{$img});
+    $done{$img} = 1;
+    push @imgs, $img;
+    print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+  }
+
+  return ($title, \@imgs);
+}
+
+
+###################################################################### SFWeekly
+
+sub weekly_list($$) {
+  my ($base_url, $body) = @_;
+
+  my $title = undef;
+  my @imgs = ();
+  my $url = $base_url;
+
+  print STDERR "$progname: parsing $url\n" if ($verbose);
+  $body = (LWP::Simple::get($url) || '')
+    unless $body;
+
+  ($title) = ($body =~ m@<TITLE[^<>]*>\s*(.*?)\s*</TITLE>@si)
+    unless defined ($title);
+
+  $title =~ s@ - Slideshows$@@si;
+  $title =~ s@ - San Francisco$@@si;
+
+  my ($imgs) = ($body =~ m@photoData:\s*{(.*)}},@si);
+  error ("No photoData in $url") unless $imgs;
+
+  foreach (split (/\}/, $imgs)) {
+    s/\\//gs;
+    my ($img) = m/"Photo":"(.*?)"/si;
+    next unless $img;
+    $img =~ s@\.\d+\.jpg$@.0.jpg@s;		# Get the larger sized image
+    $img = expand_url ($img, $base_url);
+    push @imgs, $img;
+    print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+  }
+
+  return ($title, \@imgs);
+}
+
+
+###################################################################### OvaHere
+
+sub ovahere_list($$) {
+  my ($base_url, $body) = @_;
+
+  my $title = undef;
+  my @imgs = ();
+  my $url = $base_url;
+
+  $url =~ m@gallerydetail@i ||
+    error ("this only works on \"gallerydetail\" URLs: $url");
+
+  while ($url) {
+
+    print STDERR "$progname: parsing $url\n" if ($verbose);
+    $body = (LWP::Simple::get($url) || '')
+      unless $body;
+
+    ($title) = ($body =~ m@<TITLE[^<>]*>\s*(.*?)\s*</TITLE>@si)
+      unless $title;
+
+    $body =~ s/\s+/ /gs;
+    $body =~ s/</\n</gs;
+
+    foreach (split (/\n/, $body)) {
+      my ($url2) = m@<IMG\b[^<>]*SRC=\"([^<>\"]+)\"@si;
+      next unless $url2;
+      next unless ($url2 =~ m@\.jpg$@);
+      next unless ($url2 =~ m@/Gallery/@);
+
+      ($url2 =~ s@__w\d\d+\.@__w1000.@s) ||
+        error ("unable to edit size in URL: $url2");
+
+      push @imgs, $url2;
+      print STDERR "$progname: queue: $url2\n" if ($verbose > 2);
+    }
+
+    # Get the next page too.
+    if ($body =~ m@(<INPUT\b[^<>]*VALUE="Next"[^<>]*>)@si) {
+      my $u2 = $url;
+      if ($u2 =~ m/PageNum=(\d+)/) {
+        my $p = $1;
+        $p++;
+        $u2 =~ s@(PageNum=)\d+@$1$p@s;
+      } else {
+        $u2 .= "&PageNum=2";
+      }
+      $url = $u2;
+    } else {
+      $url = undef;
+    }
+    $body = undef;
+  }
+
+  return ($title, \@imgs);
+}
+
+
+###################################################################### Facebook
+
+sub facebook_load_url($) {
+  my ($url) = @_;
+  my $body = (LWP::Simple::get($url) || '');
+
+  # What a load of shit.
+  # For some reason the LWP in /usr/bin/perl can't connect to Facebook any
+  # more. The LWP in /opt/local/bin/perl works fine, but only /usr/bin/perl
+  # has the "Foundation" module, and thus is the only one that can read
+  # Safari cookies.
+  #
+  # So if LWP isn't working, extract the cookies and invoke wget instead.
+  #  FFFFUUUUUUUUUU....
+  #
+  if (! $body) {
+    my @cmd = ("wget", "-qO-", $url);
+    my @c = ();
+    $LWP::Simple::ua->cookie_jar->scan (
+      sub() {
+        my ($version, $key, $val, $path, $domain, $port, $path_spec,
+            $secure, $expires, $discard, $hash) = @_;
+        next unless ($domain =~ m/\bfacebook\.com$/s);
+        push @c, "$key=$val";
+        } );
+    push @cmd, ("--header", "Cookie: " . join("; ", @c));
+
+    my $cmd = "'" . join ("' '", @cmd) . "'";
+    print STDERR "$progname: exec: $cmd\n"
+      if ($verbose > 1);
+    $body = `$cmd`;
+  }
+
+  return $body;
+}
+
+sub facebook_list($$) {
+  my ($url, $body) = @_;
+
+  # Rewrite "/media_set?set=" to "/media/set/?set=" else mobile site is 404.
+  $url =~ s@/[^/]+/media_set\b@/media/set/@gs;
+
+  $url =~ m@/media/set@i ||
+    error ("this only works on \"media/set/\" URLs: $url");
+
+  # Use the mobile site, because it gives us real HTML instead of AJAX fuckery.
+  $url =~ s@^(https://)www\.@$1m.@si;
+
+  my $base_url = $url;
+
+  print STDERR "$progname: parsing $url\n" if ($verbose);
+
+  # Fucking Facebook.
+  load_safari_cookies ($LWP::Simple::ua, '\bfacebook\.com$');
+
+  if (0) {
+    my $ua = $LWP::Simple::ua;
+    $ua->add_handler("request_send",  sub { shift->dump; return });
+    $ua->add_handler("response_done", sub { shift->dump; return });
+  }
+
+  $body = facebook_load_url ($url)
+    unless $body;
+
+  my $err;
+  $err = $1 if ($body =~ m/(This content is currently unavailable)/si);
+  $err = $1 if ($body =~ m/class="(?:main_message|mfss)">(You must log in[^<>]*)/si);
+  $err = "null response" unless $body;
+
+  $err .= ("\n$progname: This may be because we were unable to load any" .
+           " Safari cookies.\n" .
+           "$progname: Log in to Facebook using Safari and try again.")
+    if ($err && !$cookies_loaded_p);
+
+#  return facebook_list_graph ($url)
+#    if $err;
+
+  error ($err) if ($err);
+
+  $body =~ s@\\u003c@>@gsi;
+
+  my @pages = ();
+  my ($title) = ($body =~ m@<TITLE[^<>]*>\s*(.*?)\s*</TITLE>@si);
+  error ("no title? that's unlikely.") unless $title;
+
+
+  my ($by) = ($body =~ m@ by <a[^<>]*>(.*?)</a>@si);
+  $title = "$by: $title" if ($by);
+  $title =~ s/ \| .*//s;
+
+  my $ourl = $url;
+  my $start = 0;
+
+  my $expected = 0;
+  if ($body =~ m/>\s*See (\d+) more photos\s*</si) {
+    $expected = $1 + 12;
+  }
+
+  my %dup;
+  while (1) {
+    my $count = 0;
+
+    $body =~ s/(<A\b)/\n$1/gsi;
+    foreach (split (/\n/s, $body)) {
+      next unless (m@^<A\b@si);
+      my ($href) = m@href=\"([^\"]+)@si;
+      next unless $href;
+      next unless ($href =~ m@/photos/|/photo.php\?@s);
+
+      next if ($dup{$href});
+      $dup{$href} = 1;
+
+      $href =~ s/&amp;/&/gs;
+      $href = expand_url ($href, $base_url);
+
+      push @pages, $href;
+      print STDERR "$progname: queue: $href\n" if ($verbose > 2);
+      $count++;
+    }
+
+    last if ($count == 0);
+
+    $start += $count;
+    $url = "$ourl&s=$start";
+    $body =~ s@\\u003c@>@gsi;
+
+    print STDERR "$progname: parsing $url\n" if ($verbose);
+    $body = facebook_load_url ($url);
+  }
+
+  my @imgs;
+  my $total = 0;
+
+  foreach my $page (@pages) {
+    print STDERR "$progname: parsing sub-page $page\n" if ($verbose);
+    $body = facebook_load_url ($page);
+
+    my ($a) = ($body =~ m@(<A[^<>]+>)\s*View Full Size@si);
+    if (! $a) {
+      print STDERR "$progname: no A on $page\n";
+      next;
+    }
+    my ($href) = ($a =~ m@href=\"([^\"]+)@si);
+    if (! $href) {
+      print STDERR "$progname: unparsable: $href on $page\n";
+      next;
+    }
+
+    $href =~ s/&amp;/&/gs;
+    $href = expand_url ($href, $page);
+
+    next if ($dup{$href});
+    $dup{$href} = 1;
+
+    my ($id) = ($href =~
+                m@_(\d{10,})_\d+(_[a-z])?(\.[a-z\d]+)?\.[a-z\d]+($|\?)@s);
+    if (! $id) {
+      print STDERR "$progname: unparsable ID: $href on $page\n";
+      next;
+    }
+
+    next if ($dup{$id});
+    $dup{$id} = 1;
+
+    push @imgs, $href;
+    print STDERR "$progname: queue: $href\n" if ($verbose > 2);
+    $total++;
+  }
+
+  print STDERR "$progname: WARNING: found $total expected $expected\n"
+    unless ($total == $expected);
+
+  return ($title, \@imgs);
+}
+
+
+# We could read Facebook galleries through the graph API instead of by
+# scraping the mobile site, but that would require having an access token
+# for an FB app to authenticate.  If we scrape the mobile site, we can 
+# just use the existing login cookie, but cookies don't give you access
+# to the graph API.
+
+
+#sub load_access_token($) {
+#  my ($app) = @_;
+#  my $file = $ENV{HOME} . "/.$app-facebook-pass";
+#  my $token  = undef;
+#  my $secret = undef;
+#  if (open (my $in, '<', $file)) {
+#    while (<$in>) {
+#      if    (m/^(?:OAUTH2|ACCESS_TOKEN):\s*(.*?)\s*$/s) { $token  = $1; }
+#      elsif (m/^(?:SECRET):\s*(.*?)\s*$/s)              { $secret = $1; }
+#    }
+#    close $in;
+#  } else {
+#    return ();
+#  }
+#  error ("no access token in $file\n\n" .
+#         "\t\t run: facebook-rss.pl --generate-session\n")
+#    unless $token;
+#  print STDERR "$progname: read $file\n" if ($verbose > 1);
+#  return ($token, $secret);
+#}
+
+
+#sub facebook_list_graph($) {
+#  my ($url) = @_;
+#  my ($id) = ($url =~ m@set=[a-z]+\.(\d+)@si);
+#  error ("unparsable graph URL: $url") unless $id;
+#
+#  my ($token, $secret) = load_access_token ($ENV{USER});
+#
+#  $url = "https://graph.facebook.com/$id";
+#  $url .= "?access_token=$token" if $token;
+#
+#  print STDERR "$progname: parsing $url\n" if ($verbose);
+#  my $json = (LWP::Simple::get($url) || '');
+#
+#  error ("no json: $url") unless ($json);
+#  my $data = JSON::Any->new->jsonToObj ($json);
+#
+#  error ("JSON: " . $data->{error}->{message})
+#    if ($data->{error});
+#
+#  my $title = $data->{name} || "Facebook $id";
+#  my $expected = $data->{count};
+#
+#  $url = "https://graph.facebook.com/$id/photos?limit=10000";
+#  $url .= "&access_token=$token" if $token;
+#
+#  print STDERR "$progname: parsing $url\n" if ($verbose);
+#  $json = (LWP::Simple::get($url) || '');
+#  error ("no json: $url") unless (length ($json) > 100);
+#  $data = JSON::Any->new->jsonToObj ($json);
+#  error ("no photos in json: $url")
+#    unless ($data && $data->{data});
+#
+#  my @imgs;
+#  my %dup;
+#  my $count = 0;
+#  foreach my $item (@{$data->{data}}) {
+#    my $img = @{$item->{images}}[0]->{source};
+#    next if ($dup{$img});
+#    $dup{$img} = 1;
+#
+#    push @imgs, $img;
+#    $count++;
+#    print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+#  }
+#
+#  print STDERR "$progname: WARNING: found $count expected $expected\n"
+#    unless ($count == $expected);
+#
+#  return ($title, \@imgs);
+#}
+
+
+
+# Facebook doesn't give us sensible modification dates on JPEGs, or EXIF
+# data, so this custom downloader uses the graph API to find the upload
+# date of the photo and set the date of the downloaded file to that.
+#
+# If by some chance the file *did* have EXIF data, that would take
+# priority, when download_gallery() calls parse_exif() above.
+#
+sub facebook_down($$) {
+  my ($img, $file) = @_;
+
+  my ($id) = ($img =~
+              m@_(\d{10,})_\d+(_[a-z])?(\.[a-z\d]+)?\.[a-z\d]+($|\?)@s);
+  error ("unparsable id: $img") unless $id;
+
+  my $graph = (LWP::Simple::get("https://graph.facebook.com/$id") || '');
+  my $time;
+
+  if ($graph) {  # Doesn't always work.
+    ($time) = ($graph =~ m@"created_time":"([^\"]+)"@s);
+    $time = str2time ($time) if $time;  # 2013-01-10T23:09:00+0000
+    error ("$img: unparsable time") unless $time;
+  }
+
+  download_image ($img, $file, $time);
+}
+
+
+###################################################################### Picasa
+
+sub picasa_list($$) {
+  my ($base_url, $body) = @_;
+
+  my @imgs = ();
+  my $url = $base_url;
+
+  print STDERR "$progname: parsing $url\n" if ($verbose);
+  $body = (LWP::Simple::get($url) || '')
+    unless $body;
+
+  if (! ($body =~ m@<link \b
+                    [^<>]*? \s+ type="application/rss\+xml"
+                    [^<>]*? \s+ href="([^<>\"]+)"@sxi)) {
+    error ("no RSS link in $url");
+  }
+  $url = $1;
+
+  print STDERR "$progname: parsing $url\n" if ($verbose);
+  $body = (LWP::Simple::get($url) || '');
+
+  my ($title) = ($body =~ m@<TITLE[^<>]*>\s*(.*?)\s*</TITLE>@si);
+  my ($author) = ($body =~ m@<media:credit>([^<>]+)@si);
+  $title = "$title, $author" if $author;
+
+  $body =~ s/\s+/ /gs;
+  $body =~ s/(<item)/\n$1/gs;
+  my @items = split (/\n/, $body);
+  shift @items;
+
+  foreach (@items) {
+    my ($url2) = (m@<enclosure \s+ [^<>]*? \b url=[\'\"] ([^\'\"]+) @six);
+    next unless $url2;
+    next unless ($url2 =~ m@\.(jpg|png)$@);
+    push @imgs, $url2;
+  }
+
+  return ($title, \@imgs);
+}
+
+
+############################################################### Google Drive
+
+sub googledrive_list($$) {
+  my ($base_url, $body) = @_;
+
+  my ($title) = ($body =~ m@<title>(.*?)</title>@si);
+  my ($data) = ($body =~ m@\bvar data\b(.*?)};@s);
+  error ("no data") unless $data;
+
+  ($data) = ($data =~ m@viewerItems:\s*\[(.*?\])\s*\]@s);
+  error ("no viewerItems") unless $data;
+  $data =~ s/\s+/ /gs;
+
+  my @imgs = ();
+
+  my %done;
+  foreach my $line (split(/\]\s*,/, $data)) {
+    my ($img) = ($line =~ m@"(https?:.*?)"@si);
+    next unless $img;
+    next if ($done{$img});
+    $done{$img} = 1;
+    $img .= '#.jpg';   # needs a suffix
+    push @imgs, $img;
+    print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+  }
+
+  return ($title, \@imgs);
+}
+
+
+################################################################## SkyDrive
+
+sub skydrive_list($$) {
+  my ($base_url, $body) = @_;
+
+  my ($title) = ($body =~ m@<title>(.*?)</title>@si);
+
+  if (! $title) {
+    ($title) = ($body =~ m@"creatorName":\s*"(.*?)"@s);
+    my ($d) = ($body =~ m@"displayCreationDate":\s*"(.*?)"@s);
+    $title .= " $d" if $d;
+  }
+  if ($title) {
+    $title =~ s@/@-@gs;
+    $title =~ s/\\//gs;
+  }
+
+  my ($data) = ($body =~ m@\bvar primedResponse\b(.*?)};@s);
+  error ("no data") unless $data;
+
+  $data =~ s/\s+/ /gs;
+  $data =~ s/("download")/\n$1/gs;
+
+  my @imgs = ();
+
+  my %done;
+  foreach my $line (split(/\n/, $data)) {
+    my ($img) = ($line =~ m@"(https?:.*?)"@si);
+    next unless $img;
+    $img =~ s/\\//gs;
+    next unless ($img =~ m/\bdownload\b/s);
+    $img =~ s/\?.*$//s;
+    next if ($done{$img});
+    $done{$img} = 1;
+    $img .= '#.jpg';   # needs a suffix
+    push @imgs, $img;
+    print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+  }
+
+  return ($title, \@imgs);
+}
+
+################################################################## Instagram
+
+sub instagram_list($$) {
+  my ($base_url, $body) = @_;
+
+  my ($tag) = ($base_url =~ m@(?:/tag)?/([^/]+)/?$@si);
+  error ("unparsable instagram URL: $base_url") unless $tag;
+
+#  my $url = "http://instagram.com/tags/$tag/feed/recent.rss";
+  my $token = "b59fbe4563944b6c88cced13495c0f49";  # gramfeed.com
+  my $url = "https://api.instagram.com/v1/tags/$tag/media/recent" .
+            "?client_id=$token&count=10000";
+
+  print STDERR "$progname: parsing $url\n" if ($verbose);
+  $body = (LWP::Simple::get($url) || '');
+
+  my $title = "Instagram: $tag";
+
+#  $body =~ s/(<item)/\001$1/gs;
+  $body =~ s/("link")/\001$1/gs;
+  my @items = split(/\001/, $body);
+  shift @items;
+
+  my %done;
+  my @imgs;
+  foreach my $item (@items) {
+    $item =~ s/\\//gs;
+#    my ($img) = ($item =~ m/<link>(.*?)</si);
+    my ($img) = ($item =~ m/"standard_resolution":{"url":\s*"(.*?)"/s);
+       ($img) = ($item =~ m/"url":\s*"(.*?)"/s) unless $url;
+    next unless $img;
+    next if ($done{$img});
+    $done{$img} = 1;
+    push @imgs, $img;
+    print STDERR "$progname: queue: $img\n" if ($verbose > 2);
+  }
+
+  return ($title, \@imgs);
+}
+
+
+######################################################################
+
+
+sub error($) {
+  my ($err) = @_;
+  print STDERR "$progname: $err\n";
+  exit 1;
+}
+
+sub usage() {
+  print STDERR "usage: $progname [--verbose] [--debug] gallery-url ...\n";
+  exit 1;
+}
+
+sub main() {
+  my @urls;
+  while ($#ARGV >= 0) {
+    $_ = shift @ARGV;
+    if (m/^--?verbose$/) { $verbose++; }
+    elsif (m/^-v+$/) { $verbose += length($_)-1; }
+    elsif (m/^--?debug$/) { $debug_p++; }
+    elsif (m/^-./) { usage; }
+    else { push @urls, $_; }
+  }
+  usage unless ($#urls >= 0);
+
+  foreach my $url (@urls) {
+    download_gallery ($url);
+  }
+}
+
+main();
+exit 0;

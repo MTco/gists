@@ -1,0 +1,228 @@
+#!/usr/bin/perl -w
+# Copyright © 2011-2016 Jamie Zawinski <jwz@jwz.org>
+#
+# Permission to use, copy, modify, distribute, and sell this software and its
+# documentation for any purpose is hereby granted without fee, provided that
+# the above copyright notice appear in all copies and that both that
+# copyright notice and this permission notice appear in supporting
+# documentation.  No representations are made about the suitability of this
+# software for any purpose.  It is provided "as is" without express or 
+# implied warranty.
+#
+# Talks to my Arduino-based curtain-opening servo.
+# See http://www.jwz.org/curtain/ for details.
+#
+# E.g.:
+#
+#    curtain open
+#    curtain close
+#    curtain stop
+#    curtain toggle
+#    curtain query	-> OPEN, CLOSED, OPENING, CLOSING
+#
+# Created: 30-Aug-2011
+
+require 5;
+use diagnostics;
+use strict;
+
+use POSIX;
+use Socket;
+use IO::Handle;
+
+my $progname = $0; $progname =~ s@.*/@@g;
+my ($version) = ('$Revision: 1.4 $' =~ m/\s(\d[.\d]+)\s/s);
+
+my $verbose = 1;
+my $debug   = 0;
+
+my $device = "curtain:10001";
+my $http_proxy = undef;
+
+my $command_delay = 0.95;
+
+
+sub open_conn() {
+
+  if ($debug) {
+    open (SERIAL, "+</dev/null");
+    print STDERR "$progname: opened /dev/null (debug mode)\n"
+      if ($verbose > 1);
+    return;
+  }
+
+  if ($device !~ m@^([^:/]+):([^:/.]+)$@) {
+    error ("unparsable device: $device");
+  }
+  my $host = $1;
+  my $port = $2;
+
+  my $host2 = $host;
+  my $port2 = $port;
+  if ($http_proxy) {
+    $device = $http_proxy if $http_proxy;
+    ($host2,$port2) = split(/:/, $device);
+    $port2 = 80 unless $port2;
+  }
+
+  my ($remote, $iaddr, $paddr, $proto, $line);
+  $remote = $host2;
+  if ($port2 =~ /\D/) { $port2 = getservbyname($port2, 'tcp') }
+  error ("unrecognised port: $port2") unless ($port2);
+  $iaddr   = inet_aton($remote);
+  error ("host not found: $remote") unless ($iaddr);
+  $paddr = sockaddr_in($port2, $iaddr);
+  $proto = getprotobyname('tcp');
+
+  if (!socket(SERIAL, PF_INET, SOCK_STREAM, $proto)) {
+    error ("socket: $!");
+  }
+  print STDERR "$progname: connecting to $device\n" if ($verbose > 1);
+  if (!connect(SERIAL, $paddr)) {
+    error ("connect: $device: $!");
+  }
+
+  print STDERR "$progname: connected to $device\n" if ($verbose > 1);
+
+  # Set unbuffered (is this necessary?)
+  #
+  select((select(SERIAL), $| = 1)[0]);
+
+  # Set nonblocking
+  #
+  my $flags = fcntl(SERIAL, F_GETFL, 0) ||
+    error ("can't get flags for the socket: $!");
+  $flags = fcntl(SERIAL, F_SETFL, $flags | O_NONBLOCK) ||
+    error ("can't set flags for the socket: $!");
+
+  print STDERR "$progname: initialized connection\n" if ($verbose > 1);
+
+
+  # Flush any bits on the stream already.
+  #
+  my $buf = "";
+  while (sysread(SERIAL, $buf, 1024)) {
+    if ($verbose > 1) {
+      $buf =~ s/\r\n/\n/g;
+      $buf =~ s/\r/\n/g;
+      $buf =~ s/\n$//s;
+      foreach (split (/\n/, $buf)) {
+        $_ = sprintf "%-8s (flush)", $_;
+        print STDERR "$progname: <<< $_\n";
+      }
+    }
+  }
+}
+
+sub close_conn() {
+  if ($debug) {
+    print STDERR "$progname: close (debug)\n";
+    return;
+  }
+  close SERIAL || error ("$device: $!");
+  print STDERR "$progname: closed $device\n" if ($verbose > 1);
+}
+
+
+# Like sleep but is guaranteed to work on fractions of a second.
+sub my_sleep($) {
+  my ($secs) = @_;
+  print STDERR "$progname:    sleep $secs\n" if ($verbose > 3);
+  select(undef, undef, undef, $secs);
+}
+
+
+# write a one-line command.
+#
+sub raw_cmd($) {
+  my ($cmd) = @_;
+  $cmd =~ s/[\r\n]+$//gs;
+
+  $cmd = uc($cmd);
+
+  (print SERIAL "$cmd\n") || error ("$device: $!");
+  print STDERR "$progname:  >>> $cmd\n" if ($verbose > 2);
+}
+
+# read a response from a command.
+# This is assumed to be a single line.
+#
+sub raw_reply() {
+
+  return "" if $debug;
+
+  my $wait = $command_delay;   # wait no longer than this long for a reply.
+
+  my $result = "";
+  while (1) {
+    my $rin='';
+    my $rout;
+    vec($rin,fileno(SERIAL),1) = 1;
+
+    my $nfound = select($rout=$rin, undef, undef, $wait);
+    # $wait = 0;
+    last unless $nfound;
+    my $buf = '';
+    while (sysread (SERIAL, $buf, 1024)) {
+      $result .= $buf;
+    }
+  }
+
+  # convert linebreaks.
+  #
+  $result =~ s/\r\n/\n/g;
+  $result =~ s/\r/\n/g;
+
+  $result =~ s/^-.*\n//gm;
+  $result =~ s/\n+$//s;
+
+  # print what we got...
+  #
+  if ($verbose > 2) {
+    if ($result =~ m/^\s*$/s) {
+      print STDERR "$progname:  <<< no reply!\n";
+      } else {
+        foreach (split (/\n/, $result)) {
+          print STDERR "$progname:  <<< $_\n";
+        }
+    }
+  }
+
+  return $result;
+}
+
+
+sub error($) {
+  my ($err) = @_;
+  print STDERR "$progname: $err\n";
+  exit 1;
+}
+
+sub usage() {
+  print STDERR "usage: $progname [--verbose] [OPEN | CLOSE | STOP | TOGGLE | QUERY ]\n";
+  exit 1;
+}
+
+sub main() {
+  my $cmd;
+  while ($#ARGV >= 0) {
+    $_ = shift @ARGV;
+    if (m/^--?verbose$/) { $verbose++; }
+    elsif (m/^-v+$/) { $verbose += length($_)-1; }
+    elsif (m/^--?(q|quiet)$/) { $verbose--; }
+    elsif (m/^--?debug$/) { $debug++; }
+    elsif (m/^-/) { usage(); }
+    elsif (!defined($cmd)) { $cmd = $_; }
+    else { usage(); }
+  }
+
+  usage unless defined($cmd);
+  open_conn ();
+  raw_cmd ($cmd);
+  my $reply = raw_reply();
+  print "$reply\n" if ($verbose);
+  close_conn ();
+}
+
+main();
+exit 0;

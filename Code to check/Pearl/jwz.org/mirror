@@ -1,0 +1,92 @@
+#!/usr/bin/perl -w
+# Copyright © 2004-2008 Jamie Zawinski <jwz@jwz.org>
+#
+# Permission to use, copy, modify, distribute, and sell this software and its
+# documentation for any purpose is hereby granted without fee, provided that
+# the above copyright notice appear in all copies and that both that
+# copyright notice and this permission notice appear in supporting
+# documentation.  No representations are made about the suitability of this
+# software for any purpose.  It is provided "as is" without express or 
+# implied warranty.
+#
+# A wrapper for wget that automatically computes a proper "--cut-dirs" value
+# based on the number of directory components in the given base URL.
+# E.g., "mirror http://host/A/B/C/" will use --cut-dirs=2, meaning that
+# "/A/B/C/D/E/index.html" will become "./E/index.html".
+#
+# If more than one URL is specified, --cut-dirs is computed independently
+# for each of them.
+#
+# Created: 28-May-2004.
+
+require 5;
+use diagnostics;
+use strict;
+
+my $progname = $0; $progname =~ s@.*/@@g;
+my $version = q{ $Revision: 1.3 $ }; $version =~ s/^[^0-9]+([0-9.]+).*$/$1/;
+
+my $verbose = 0;
+
+my @wget_command = split(/ /, "wget -m -np -nH");
+
+sub mirror($@) {
+  my ($url, @args) = @_;
+
+  my $n;
+  {
+    my ($url_proto, $dummy, $serverstring, $path) = split(/\//, $url, 4);
+    $path = "" unless $path;
+    $path =~ s@//+@/@g;
+    $path =~ s@^/@@;
+    $path =~ s@/$@@;
+    my @dirs = split (/\//, $path);
+    $n = $#dirs;
+  }
+
+  my @cmd = @wget_command;
+  push @cmd, "-nv" if ($verbose <= 1);
+  push @cmd, "--cut-dirs=$n";
+  push @cmd, @args;
+  push @cmd, $url;
+
+  print STDERR "$progname: " . join (' ', @cmd) . "\n" if ($verbose);
+
+  system @cmd;
+  my $exit_value  = $? >> 8;
+  my $signal_num  = $? & 127;
+  my $dumped_core = $? & 128;
+  error ("$cmd[0]: core dumped!") if ($dumped_core);
+  error ("$cmd[0]: signal $signal_num!") if ($signal_num);
+  error ("$cmd[0]: exited with $exit_value!") if ($exit_value);
+}
+
+
+sub error($) {
+  ($_) = @_;
+  print STDERR "$progname: $_\n";
+  exit 1;
+}
+
+sub usage() {
+  print STDERR "usage: $progname [--verbose] urls ...\n";
+  exit 1;
+}
+
+sub main() {
+  my @urls = ();
+  my @args = ();
+  while ($#ARGV >= 0) {
+    $_ = shift @ARGV;
+    if ($_ eq "--verbose") { $verbose++; }
+    elsif (m/^-v+$/) { $verbose += length($_)-1; }
+    elsif (m/^-./) { push @args, $_; }
+    elsif (m/^[a-z]+:/) { push @urls, $_; }
+    else { usage; }
+  }
+  usage unless ($#urls >= 0);
+  foreach (@urls) { mirror ($_, @args); }
+}
+
+main;
+exit 0;

@@ -1,0 +1,192 @@
+#!/usr/bin/perl -w
+# copyright-image --- slaps a copyright notice on a GIF or JPEG.
+# Copyright © 1998-2008 Jamie Zawinski <jwz@jwz.org>
+#
+# Permission to use, copy, modify, distribute, and sell this software and its
+# documentation for any purpose is hereby granted without fee, provided that
+# the above copyright notice appear in all copies and that both that
+# copyright notice and this permission notice appear in supporting
+# documentation.  No representations are made about the suitability of this
+# software for any purpose.  It is provided "as is" without express or 
+# implied warranty.
+#
+# Created: 23-Jun-98.
+
+require 5;
+use diagnostics;
+use strict;
+use bytes;
+
+my $progname = $0; $progname =~ s@.*/@@g;
+my $version = q{ $Revision: 1.12 $ }; $version =~ s/^[^0-9]+([0-9.]+).*$/$1/;
+
+my $verbose = 1;
+
+
+my $copyright_name  = 'Jamie Zawinski';
+my $copyright_email = 'jwz@jwz.org';
+my $copyright_url   = 'http://www.jwz.org/';
+my $copyright = 
+  ("Copyright (c) %%YEAR%% $copyright_name <$copyright_email>\n" .
+   "$copyright_url\n" .
+   "\n");
+
+
+sub error {
+  ($_) = @_;
+  print STDERR "$progname: $_\n";
+  exit 1;
+}
+
+
+sub copyright_image {
+  my ($file, $year, $preserve_date_p) = @_;
+
+  local *IN;
+  open(IN, "<$file") || error "couldn't read $file";
+  my $cmd;
+  local $/ = undef;  # read entire file
+  my $img = <IN>;
+  my $date = (stat(IN))[9];
+  close(IN);
+
+  my $pretty_file = ($file eq "-" ? "<stdin>" : $file);
+  my $exif_p = 0;
+
+  # If this file is named like a Canon or Nikon digital camera file,
+  # stuff the file name into the comment -- this is so that the original
+  # file name doesn't get lost if I rename/renumber the files later
+  # when putting them in a gallery.
+  #
+  my $orig_file = $file;
+  $orig_file =~ s@^.*/([^/]*)$@$1@;
+  $orig_file = '' unless ($orig_file =~ m@^(img_|crw_|dscn)\d+\.@i);
+
+
+  $_ = $img;
+  if ( m/^\377\330\377[\340\341\376]/ ) {
+    $cmd = "wrjpgcom -replace -comment";
+    $exif_p = 1;
+    print STDERR "$progname: read JPEG $pretty_file\n" if ($verbose > 2);
+  } elsif ( m/^\111\111[\052\053]\000/ ||
+            m/^\115\115\000[\052\053]/ ) {
+    $cmd = "cat";
+    $exif_p = 1;
+    print STDERR "$progname: read TIFF $pretty_file\n" if ($verbose > 2);
+  } elsif ( m/^GIF8[79]a/ ) {
+    $cmd = "giftrans -C -c";
+    print STDERR "$progname: read GIF $pretty_file\n" if ($verbose > 2);
+  } else {
+    error "not a JPEG, TIFF, or GIF: $pretty_file";
+  }
+
+  my $tmp = "$file.$$";
+
+  my $cc = $copyright;
+  $cc =~ s/%%YEAR%%/$year/g;
+
+  if ($orig_file ne '') {
+    $cc .= "$orig_file \n\n";
+  }
+
+  my $cmd2 = ($cmd eq 'cat' ? $cmd : "$cmd \"$cc\"");
+  local *OUT;
+  open(OUT, "| $cmd2 > $tmp") || error ("can't exec $cmd \"...\"");
+
+  print STDERR "$progname: executing: \"$cmd '...$year...'\"\n"
+    if ($verbose > 2);
+
+  print OUT $img;
+  close(OUT);
+
+  if ($exif_p) {
+    my @cmd = ("exiftool",
+               "-q",
+               "-overwrite_original",
+               "-Artist=$copyright_name",
+               "-Creator=$copyright_name",
+               "-By-line=$copyright_name",
+               "-CreatorContactInfoCiEmailWork=$copyright_email",
+               "-CreatorContactInfoCiUrlWork=$copyright_url",
+               "-Copyright=$cc",
+               "-CopyrightNotice=$cc",
+               "-Rights=$cc",
+               $tmp
+              );
+    print STDERR "$progname: executing: " . join(' ', @cmd) . "\n"
+      if ($verbose > 2);
+
+    system @cmd;
+  }
+
+  if ($preserve_date_p) {
+    utime (time, $date, $tmp) || error ("changing date of $tmp: $!");
+    print STDERR "$progname: touch $tmp to " . localtime($date) . "\n"
+      if ($verbose > 2);
+  }
+
+  if ( $file eq "-" ) {
+    open(IN, "<$tmp") || error "couldn't read $tmp";
+    print STDERR "$progname: writing to <stdout>...\n" if ($verbose > 2);
+    while (<IN>) { print; }
+    close(IN);
+    unlink($tmp);
+
+  } else {
+
+    my @cmp_cmd = ("cmp", "-s", "$tmp", "$file");
+    print STDERR "$progname: executing \"" .
+      join(" ", @cmp_cmd) . "\"\n" if ($verbose > 2);
+
+    if (system (@cmp_cmd)) {
+
+      if (!rename ("$tmp", "$file")) {
+        unlink "$tmp";
+        error "mv $tmp $file: $!";
+      }
+
+      print STDERR "$progname: wrote $pretty_file\n" if ($verbose);
+
+    } else {
+      unlink "$tmp" || error "rm $tmp: $!\n";
+      print STDERR "$progname: $pretty_file unchanged\n" if ($verbose > 1);
+      print STDERR "$progname: rm $tmp\n" if ($verbose > 2);
+    }
+  }
+}
+
+
+sub usage {
+  print STDERR "usage: $progname [--verbose] [--year YYYY] [--keep-date] " .
+    "gif-or-jpeg-files ...\n";
+  exit 1;
+}
+
+sub main {
+  my $year = 0;
+  my $preserve_date_p = 0;
+
+  my @files = ();
+  while ($_ = $ARGV[0]) {
+    shift @ARGV;
+    if ($_ eq "--verbose") { $verbose++; }
+    elsif (m/^-v+$/) { $verbose += length($_)-1; }
+    elsif (m/^-q+$/) { $verbose -= length($_)-1; }
+    elsif ($_ eq "--year" || $_ eq "-y") {
+      error ("--year can only be specified once") if ($year);
+      $year = shift @ARGV; }
+    elsif ($_ eq "--keep-date") { $preserve_date_p = 1; }
+    elsif (m/^-./) { usage; }
+    else { push @files, $_; }
+  }
+
+  $year = 1900 + (localtime(time))[5] unless ($year);
+  usage unless ($#files >= 0);
+
+  foreach my $file (@files) {
+    copyright_image ($file, $year, $preserve_date_p);
+  }
+}
+
+main;
+exit 0;
