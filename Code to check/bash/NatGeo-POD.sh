@@ -1,55 +1,55 @@
-#!/bin/bash  
- # Copyright (c) 2011 Josh Schreuder  
- # http://www.postteenageliving.com  
- #  
- # Permission is hereby granted, free of charge, to any person obtaining a copy  
- # of this software and associated documentation files (the "Software"), to deal  
- # in the Software without restriction, including without limitation the rights  
- # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell  
- # copies of the Software, and to permit persons to whom the Software is  
- # furnished to do so, subject to the following conditions:  
- #  
- # The above copyright notice and this permission notice shall be included in  
- # all copies or substantial portions of the Software.  
- #  
- # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR  
- # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,  
- # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE  
- # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER  
- # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,  
- # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN  
- # THE SOFTWARE.  
- # ********************************  
- # *** OPTIONS  
- # ********************************  
- # Set this to 'yes' to save a description (to ~/description.txt) from ngeo page  
+#!/bin/bash
+ # Copyright (c) 2011 Josh Schreuder
+ # http://www.postteenageliving.com
+ #
+ # Permission is hereby granted, free of charge, to any person obtaining a copy
+ # of this software and associated documentation files (the "Software"), to deal
+ # in the Software without restriction, including without limitation the rights
+ # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ # copies of the Software, and to permit persons to whom the Software is
+ # furnished to do so, subject to the following conditions:
+ #
+ # The above copyright notice and this permission notice shall be included in
+ # all copies or substantial portions of the Software.
+ #
+ # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ # AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ # THE SOFTWARE.
+ # ********************************
+ # *** OPTIONS
+ # ********************************
+ # Set this to 'yes' to save a description (to ~/description.txt) from ngeo page
  #
  # I can’t see where this line is used anywhere in the script, so let’s comment it out
- # GET_DESCRIPTION="yes"  
+ # GET_DESCRIPTION="yes"
  #
- # Set this to the directory you want pictures saved  
+ # Set this to the directory you want pictures saved
  PICTURE_DIR=~/Pictures/Wallpapers/NatGeo
  if [ ! -d $PICTURES_DIR ]; then
    mkdir -p $PICTURES_DIR
  fi
  sleep 1
- # ********************************  
- # *** FUNCTIONS  
- # ********************************  
- function get_page {  
-   echo "Downloading page to find image"  
-   wget http://photography.nationalgeographic.com/photography/photo-of-the-day/ --quiet -O- 2> /dev/null |  
+ # ********************************
+ # *** FUNCTIONS
+ # ********************************
+ function get_page {
+   echo "Downloading page to find image"
+   wget http://photography.nationalgeographic.com/photography/photo-of-the-day/ --quiet -O- 2> /dev/null |
    grep -m 1 http://images.nationalgeographic.com/.*.jpg -o > /tmp/pic_url
-   wget http://photography.nationalgeographic.com/photography/photo-of-the-day/ --quiet -O- 2> /dev/null |  
+   wget http://photography.nationalgeographic.com/photography/photo-of-the-day/ --quiet -O- 2> /dev/null |
    grep -m 1 http://images.nationalgeographic.com/.*1600x1200.*.jpg -o > /tmp/pic_url2
- }  
- function clean_up {  
-   # Clean up  
-   echo "Cleaning up temporary files"  
-   if [ -e "/tmp/pic_url" ]; then  
-     rm /tmp/pic_url  
-   fi  
-   if [ -e "/tmp/pic_url2" ]; then  
+ }
+ function clean_up {
+   # Clean up
+   echo "Cleaning up temporary files"
+   if [ -e "/tmp/pic_url" ]; then
+     rm /tmp/pic_url
+   fi
+   if [ -e "/tmp/pic_url2" ]; then
      rm /tmp/pic_url2
    fi
    if [ -f "~/tmp/NatGeo.edc" ]; then
@@ -131,27 +131,27 @@ _EOF
    "--e17"	"Enlightenment Desktop"
    printf "\n"
  }
- # ********************************  
- # *** MAIN  
- # ********************************  
+ # ********************************
+ # *** MAIN
+ # ********************************
  if [ "$1" == "--help" ] || [ "$1" == "-h" ] || [ "$1" == "" ]; then
    usage
    exit
  fi
- echo "===================="  
- echo "== NGEO Wallpaper =="  
- echo "===================="  
- # Set date  
- TODAY=$(date +'%Y%m%d')  
- # If we don't have the image already today  
- if [ ! -e $PICTURES_DIR/${TODAY}_ngeo.jpg ]; then  
-   echo "We don't have the picture saved, save it"  
-   get_page  
-   # Got the link to the image  
+ echo "===================="
+ echo "== NGEO Wallpaper =="
+ echo "===================="
+ # Set date
+ TODAY=$(date +'%Y%m%d')
+ # If we don't have the image already today
+ if [ ! -e $PICTURES_DIR/${TODAY}_ngeo.jpg ]; then
+   echo "We don't have the picture saved, save it"
+   get_page
+   # Got the link to the image
    PICURL=`/bin/cat /tmp/pic_url`
    PICURL2=`/bin/cat /tmp/pic_url2`
    echo "Picture URL is: ${PICURL}"
-   echo "Picture URL 2 is: ${PICURL2}"  
+   echo "Picture URL 2 is: ${PICURL2}"
    echo "Downloading images"
    wget --quiet $PICURL -O $PICTURES_DIR/${TODAY}_ngeo.jpg
    wget --quiet $PICURL2 -O $PICTURES_DIR/${TODAY}-1600x1200_ngeo.jpg
@@ -180,28 +180,28 @@ _EOF
      e17_wallpaper
    fi
    #
- # Else if we have it already, check if it's the most updated copy  
- else  
-   get_page  
-   # Got the link to the image  
+ # Else if we have it already, check if it's the most updated copy
+ else
+   get_page
+   # Got the link to the image
    PICURL=`/bin/cat /tmp/pic_url`
    PICURL2=`/bin/cat /tmp/pic_url2`
    echo "Picture URL is: ${PICURL}"
    echo "Picture URL 2 is: ${PICURL2}"
-   # Get the filesize  
-   SITEFILESIZE=$(wget --spider $PICURL 2>&1 | grep Length | awk '{print $2}')  
-   FILEFILESIZE=$(stat -c %s $PICTURES_DIR/${TODAY}_ngeo.jpg)  
-   # If the picture has been updated  
-   if [ $SITEFILESIZE != $FILEFILESIZE ]; then  
-     echo "The pictures have been updated ... getting updated copy"  
+   # Get the filesize
+   SITEFILESIZE=$(wget --spider $PICURL 2>&1 | grep Length | awk '{print $2}')
+   FILEFILESIZE=$(stat -c %s $PICTURES_DIR/${TODAY}_ngeo.jpg)
+   # If the picture has been updated
+   if [ $SITEFILESIZE != $FILEFILESIZE ]; then
+     echo "The pictures have been updated ... getting updated copy"
      rm $PICTURES_DIR/${TODAY}_ngeo.jpg
      rm $PICTURES_DIR/${TODAY}-1600x1200_ngeo.jpg
-     # Got the link to the image  
+     # Got the link to the image
      PICURL=`/bin/cat /tmp/pic_url`
      PICURL2=`/bin/cat /tmp/pic_url2`
      echo "Downloading images"
      wget --quiet $PICURL -O $PICTURES_DIR/${TODAY}_ngeo.jpg
-     wget --quiet $PICURL2 -O $PICTURES_DIR/${TODAY}-1600x1200_ngeo.jpg      
+     wget --quiet $PICURL2 -O $PICTURES_DIR/${TODAY}-1600x1200_ngeo.jpg
    if [ "$1" != "-d" ]; then
      echo "Setting image as wallpaper"
    fi
@@ -227,9 +227,9 @@ _EOF
      e17_wallpaper
    fi
    #
-   # If the picture is the same  
-   else  
-     echo "Picture is the same, finishing up"  
+   # If the picture is the same
+   else
+     echo "Picture is the same, finishing up"
    if [ "$1" != "-d" ]; then
      echo "Setting image as wallpaper"
    fi
@@ -253,6 +253,6 @@ _EOF
      e17_wallpaper
    fi
    #
-   fi  
- fi  
- clean_up 
+   fi
+ fi
+ clean_up
